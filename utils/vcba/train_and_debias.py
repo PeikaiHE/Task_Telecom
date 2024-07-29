@@ -1,0 +1,455 @@
+# File:                     train_and_debias.py
+# Created by:               Rémi Nahon
+# Last revised by:          Rémi Nahon
+#            date:          2022/3/15
+#
+# ================================= IMPORTS =================================
+from torch.nn.functional import one_hot
+from tqdm import tqdm
+from torch.utils.data import DataLoader
+import torch
+from utils.configs import *
+from utils.tools import print_remi
+from utils.vcba.basemodel import VCBABaseModel
+from utils.tools import *
+
+# ================================== CODE ===================================
+__all__ = [
+    "compute_weighted_loss",
+    "get_centroids_from_batch",
+    "infer_predicted_bias",
+    "train_biased_model",
+    "train_test_epoch",
+    "rho_class",
+    "train_with_information_removal",
+    "test_with_information_removal",
+    "count_elements_per_class",
+    "build_predicted_bias_labels",
+    # "gather_stats"
+]
+
+
+def compute_weighted_loss(
+        base_model: VCBABaseModel,
+        output: torch.Tensor,
+        output_bottleneck: torch.Tensor,
+        target: torch.Tensor,
+        indices: torch.Tensor = None,
+        bias_target: torch.Tensor = None,
+):
+    base_model.reweighter.update(
+        output_model=output,
+        output_bottleneck=output_bottleneck,
+        target=target,
+        indices=indices,
+        bias_target=bias_target,
+        keep_centro=True,
+    )
+    if bias_target is not None:
+        weights = base_model.reweighter.weigh(bias_target=bias_target)
+    else:
+        weights = base_model.reweighter.weigh()
+    # print(weights)
+    weighted_loss = torch.mean(weights * base_model.criterion(output, target))
+    return weighted_loss
+
+
+def get_centroids_from_batch(base_model: VCBABaseModel):
+    """
+    Computes the centroids, representative of each target class
+    on the whole dataset at once, without updating the model.
+    """
+    with torch.no_grad():
+        base_model.model.eval()
+        base_model.reweighter.reset()
+        tk0 = tqdm(
+            base_model.dataloaders["train"],
+            total=int(len(base_model.dataloaders["train"])),
+            leave=True,
+        )
+        for _, (data, target, bias_target, _) in enumerate(tk0):
+            data = data.to(base_model.device)
+            target = target.to(base_model.device)
+            output = base_model.model(data).to(base_model.device)
+            bias_target = bias_target.to(base_model.device)
+            output_bottleneck = base_model.bottleneck.output
+            base_model.reweighter.update(
+                output_model=output,
+                output_bottleneck=output_bottleneck,
+                target=target,
+                bias_target=bias_target,  # careful : added for stats
+                keep_centro=False,
+            )
+def infer_predicted_bias(
+    biased_base_model: VCBABaseModel,
+    nb_prep_epochs: int = 1,
+    metric: str = "voronoi"
+):
+    """
+    Trains the vanilla model biased model while computing the distances between:
+        - the misclassified samples
+        - the Voronoi Hyperplane that separates them from their target class
+    The distance computation starts after nb_prep_epochs epochs.
+    The statististics of these distances are saved in the file args.epoch_stats_file
+    """
+    biased_base_model.epoch_distances = []
+    for epoch in range(1, nb_prep_epochs + 1):
+        train_biased_model(
+            base_model=biased_base_model,
+            epoch=epoch,
+            measure_dist=False)
+    if metric == "voronoi":
+        for epoch in range(nb_prep_epochs + 1, biased_base_model.epochs + 1):
+            print(f"Computing centroids for epoch {epoch}")
+            get_centroids_from_batch(biased_base_model)
+            biased_base_model.reweighter.define_hyperplanes()
+            train_biased_model(
+                base_model=biased_base_model,
+                epoch=epoch,
+                metric="voronoi"
+            )
+            # check and create directory
+            os.makedirs(os.path.dirname(args.epoch_stats_file), exist_ok=True)
+            # Save both files at every epoch (overwriting the previous one)
+            torch.save(biased_base_model.reweighter.stats_dist,
+                       args.epoch_stats_file)
+    if metric in ["centroid_distance", "centroid_distance_ratio"]:
+        print("in centroid distance")
+        for epoch in range(nb_prep_epochs + 1, biased_base_model.epochs + 1):
+            get_centroids_from_batch(biased_base_model)
+            train_biased_model(base_model=biased_base_model,
+                               epoch=epoch,
+                               metric=metric)
+            # check and create directory
+            os.makedirs(os.path.dirname(args.epoch_stats_file), exist_ok=True)
+            # Save both files at every epoch (overwriting the previous one)
+            torch.save(biased_base_model.reweighter.stats_dist,
+                       args.epoch_stats_file)
+
+    # Find the best epoch
+    best_epoch = biased_base_model.epoch_distances.index(max(biased_base_model.epoch_distances)) + 1
+    print(f'Best epoch for extraction (e*): {best_epoch}')
+    return best_epoch
+
+def compute_centroids(outputs, targets, num_classes):
+    centroids = torch.zeros((num_classes, outputs.size(1)), device=outputs.device)
+    counts = torch.zeros(num_classes, device=outputs.device)
+    for i in range(num_classes):
+        mask = (targets == i)
+        if mask.sum() > 0:
+            centroids[i] = outputs[mask].mean(dim=0)
+            counts[i] = mask.sum()
+    return centroids, counts
+
+def compute_voronoi_distances(outputs, targets, centroids):
+    distances = torch.zeros_like(targets, dtype=torch.float)
+    for i in range(targets.size(0)):
+        true_class = targets[i]
+        distances[i] = torch.norm(outputs[i] - centroids[true_class])
+    return distances
+
+def train_biased_model(
+        base_model: VCBABaseModel,
+        epoch: int,
+        measure_dist: bool = True,
+        metric: str = "voronoi",
+):
+    """
+    Trains a model contained in a BaseModel for 1 epoch.
+    Computes and updates the distances to Voronoi Hyperplanes
+    if compute_dist_to_hyperplane is set to True.
+    """
+    base_model.model.train()
+    loss_task_tot = AverageMeter("Loss", ":.4e")
+    misclassified = 0
+    top1 = AverageMeter("Acc@1", ":6.2f")
+    tk0 = tqdm(
+        base_model.dataloaders["train"],
+        total=int(len(base_model.dataloaders["train"])),
+        leave=True,
+    )
+    all_distances = []
+    for _, (data, target, _, idx) in enumerate(tk0):
+        data = data.to(base_model.device)
+        target = target.to(base_model.device)
+        idx = idx.to(base_model.device)
+        output = base_model.model(data)
+        output_bottleneck = base_model.bottleneck.output
+        if measure_dist:
+            base_model.reweighter.update(
+                output_model=output,
+                output_bottleneck=output_bottleneck,
+                target=target,
+                indices=idx,
+                keep_centro=True)
+            base_model.reweighter.update_dist_lists(epoch, metric)
+        loss_task = torch.mean(base_model.criterion(output, target))
+        loss_task_tot.update(loss_task.item(), data.size(0))
+        loss_task.backward()
+        base_model.optimizer.step()
+        base_model.optimizer.zero_grad()
+        acc1 = accuracy(output, target, topk=(1,))
+        top1.update(acc1[0], data.size(0))
+
+        # Calculate the distances to the hyperplanes
+        _, preds = torch.max(output, 1)
+        misclassified_mask = (preds != target)
+        misclassified_outputs = output[misclassified_mask]
+        misclassified_targets = target[misclassified_mask]
+        centroids, _ = compute_centroids(output, target, base_model.nb_classes)
+        distances = compute_voronoi_distances(misclassified_outputs, misclassified_targets, centroids)
+        all_distances.extend(distances.detach().cpu().numpy())  # 这里添加detach()
+
+        if measure_dist:
+            mask = torch.logical_not(
+                base_model.reweighter.stats_dist[:, epoch - 1, 0].isnan())
+            avg_dist_h = torch.sum(torch.nan_to_num(base_model.reweighter.stats_dist[:, epoch - 1, 0], nan=0.0)
+                                   ) / torch.sum(mask)
+            rel_dist = torch.sum(
+                torch.nan_to_num(
+                    base_model.reweighter.stats_dist[:, epoch - 1, 2], nan=0.0)
+            ) / torch.sum(mask)
+            misclassified += (
+                (target != torch.argmax(output, dim=1)).nonzero().size(0)
+            )
+            elts_tot = torch.sum((base_model.reweighter.dist_from_hyperplane[:, 0] != float('nan'))
+                                 ).item()
+            tk0.set_postfix(loss_task=loss_task_tot.avg,
+                            top1=top1.avg.item(),
+                            d_avg=avg_dist_h.item(),
+                            d_rel=rel_dist.item(),
+                            m_total=elts_tot,
+                            m_epoch=misclassified)
+        else:
+            tk0.set_postfix(loss_task=loss_task_tot.avg, top1=top1.avg.item())
+
+    # Calculate the average distance to the hyperplane
+    avg_distance = sum(all_distances) / len(all_distances) if all_distances else 0
+    base_model.epoch_distances.append(avg_distance)
+    return loss_task_tot.avg, top1.avg.item()
+
+
+def train_test_epoch(
+        base_model: VCBABaseModel, epoch: int, predicted_bias_labels: torch.Tensor
+):
+    train_results = train_with_information_removal(
+        base_model, epoch, predicted_bias_labels
+    )
+    with torch.no_grad():
+        base_model.sched.step()
+
+        test_results = test_with_information_removal(
+            base_model,
+            base_model.dataloaders["test"],
+            predicted_bias_labels=predicted_bias_labels,
+        )
+
+
+def rho_class(biased_model: VCBABaseModel, stats_dist_file_per_epoch: str = None):
+    """
+    Computes :
+        - rho_per_class : rho_t of each target class t, ie the proportion of inferred bias-aligned samples in each class
+        - predicted_bias_labels : for each sample, its inferred bias label
+        - dist_to_class : for each sample, its relative distance to its Voronoi Hyperplane ('nan' if the sample is bias-aligned)
+    """
+    if stats_dist_file_per_epoch is not None:
+        stats_dist = torch.load(stats_dist_file_per_epoch,
+                                map_location=biased_model.device)
+        print("Stats_dist loaded")
+    else:
+        stats_dist = biased_model.reweighter.stats_dist.detach()
+    non_nan_dist = torch.logical_not(stats_dist[:, :, 2].isnan())
+    mean_max_dist = torch.nan_to_num(torch.sum(torch.nan_to_num(
+        stats_dist[:, :, 2], nan=0), dim=0) / torch.sum(non_nan_dist, dim=0), nan=0)
+    best_epoch = torch.argmax(mean_max_dist) + 1
+    print(best_epoch)
+    best_epoch_stats_dist = stats_dist[:, best_epoch - 1, :].squeeze(1)
+    predicted_bias_labels = best_epoch_stats_dist[:, 1].to(torch.int64)
+    print(predicted_bias_labels)
+    dist_to_class = best_epoch_stats_dist[:, 0]
+    print(dist_to_class)
+    mask_aligned = (dist_to_class.isnan())
+    # For aligned samples (and misaligned after best epoch)
+    # set labels to target labels and distance to 1
+    predicted_bias_labels[mask_aligned] = biased_model.nb_classes
+    dist_to_class[mask_aligned] = 1
+    predicted_bias_labels_onehot = one_hot(
+        predicted_bias_labels, num_classes=biased_model.nb_classes + 1
+    )[:, : biased_model.nb_classes]
+    target_elts_class = count_elements_per_class(basemodel=biased_model)
+    elts_class = torch.sum(predicted_bias_labels_onehot, dim=0)
+    rho_per_class = (target_elts_class - elts_class) / target_elts_class
+    print(rho_per_class)
+    return rho_per_class, predicted_bias_labels, dist_to_class
+
+
+def train_with_information_removal(
+        debiased_basemodel: VCBABaseModel, epoch: int, predicted_bias_target: torch.Tensor
+):
+    """
+    Trains a model with reweighted crossentropy
+    (based on the predicted_bias_target)
+    and conditional mutual information removal
+    """
+    debiased_basemodel.model.train()
+    loss_task_tot = AverageMeter("Loss", ":.4e")
+    loss_private_tot = AverageMeter("Loss", ":.4e")
+    MI_tot = AverageMeter("Regu", ":.4e")
+    top1 = AverageMeter("Acc@1", ":6.2f")
+    private_top1 = AverageMeter("Acc@1", ":6.2f")
+    tk0 = tqdm(
+        debiased_basemodel.dataloaders["train"],
+        total=int(len(debiased_basemodel.dataloaders["train"])),
+        leave=True,
+    )
+    for _, (data, target, bias_target, indices) in enumerate(tk0):
+        data = data.to(debiased_basemodel.device)
+        target = target.to(debiased_basemodel.device)
+        indices = indices.to(debiased_basemodel.device)
+        output = debiased_basemodel.model(data)
+        output_private = debiased_basemodel.PH()
+        output_bottleneck = debiased_basemodel.bottleneck.output
+        if debiased_basemodel.reweighter.supervised:
+            private_label = bias_target.to(debiased_basemodel.device)
+            loss_task = compute_weighted_loss(
+                debiased_basemodel,
+                output,
+                output_bottleneck,
+                target,
+                indices=indices,
+                bias_target=private_label,
+            )
+        else:
+            private_label = predicted_bias_target[indices]
+            loss_task = compute_weighted_loss(
+                debiased_basemodel, output, output_bottleneck, target, indices=indices
+            )
+        loss_private = torch.mean(
+            debiased_basemodel.criterion(output_private, private_label)
+        )
+
+        if (private_label != target).nonzero().size(0) > 0:
+            MI = debiased_basemodel.MI(
+                debiased_basemodel.PH, private_label, mask=(
+                        private_label != target)
+            )
+            MI_tot.update(MI.item(), data.size(0))
+            loss_task_tot.update(loss_task.item(), data.size(0))
+            loss_private_tot.update(loss_private.item(), data.size(0))
+            loss = loss_task + debiased_basemodel.gamma * MI
+            loss.backward()
+            debiased_basemodel.PH_optimizer.zero_grad()
+            loss_private.backward()
+
+        else:
+            loss_task_tot.update(loss_task.item(), data.size(0))
+            loss_private_tot.update(loss_private.item(), data.size(0))
+            loss = loss_task + loss_private
+        debiased_basemodel.optimizer.step()
+        debiased_basemodel.optimizer.zero_grad()
+        debiased_basemodel.PH_optimizer.step()
+        debiased_basemodel.PH_optimizer.zero_grad()
+        acc1 = accuracy(output, target, topk=(1,))
+        acc1_private = accuracy(output_private, private_label, topk=(1,))
+        top1.update(acc1[0], data.size(0))
+        private_top1.update(acc1_private[0], data.size(0))
+        tk0.set_postfix(
+            loss_y=loss_task_tot.avg,
+            top1_y=top1.avg.item(),
+            loss_b=loss_private_tot.avg,
+            top1_b=private_top1.avg.item(),
+            epoch=epoch,
+        )
+    return {
+        "train_loss": loss_task_tot.avg,
+        "train_acc": top1.avg.item(),
+        "train_bias_loss": loss_private_tot.avg,
+        "train_bias_acc": private_top1.avg.item(),
+    }
+
+
+def test_with_information_removal(
+        base_model: VCBABaseModel,
+        data_loader: DataLoader,
+        predicted_bias_labels: torch.Tensor,
+):
+    """
+    Evaluates a model that uses information removal
+    """
+    base_model.model.eval()
+    loss_task_tot = AverageMeter("Loss", ":.4e")
+    loss_private_tot = AverageMeter("Loss", ":.4e")
+    top1 = AverageMeter("Acc@1", ":6.2f")
+    private_top1 = AverageMeter("Acc@1", ":6.2f")
+    tk0 = tqdm(data_loader, total=int(len(data_loader)), leave=True)
+    for _, (data, target, bias_target, indices) in enumerate(tk0):
+        data = data.to(base_model.device)
+        target = target.to(base_model.device)
+        indices = indices.to(base_model.device)
+        output = base_model.model(data)
+        output_private = base_model.PH()
+        if base_model.reweighter.supervised:
+            bias_labels = bias_target.to(base_model.device)
+        else:
+            bias_labels = predicted_bias_labels[indices].to(base_model.device)
+        loss_task = torch.mean(base_model.criterion(output, target))
+        loss_task_tot.update(loss_task.item(), data.size(0))
+        loss_private = torch.mean(
+            base_model.criterion(output_private, bias_labels))
+        loss_private_tot.update(loss_private.item(), data.size(0))
+        acc1 = accuracy(output, target, topk=(1,))
+        acc1_private = accuracy(output_private, bias_labels, topk=(1,))
+        top1.update(acc1[0], data.size(0))
+        private_top1.update(acc1_private[0], data.size(0))
+        tk0.set_postfix(
+            loss_task=loss_task_tot.avg,
+            loss_bias=loss_private_tot.avg,
+            top1=top1.avg.item(),
+            top1_bias=private_top1.avg.item(),
+        )
+        tk0.update()
+
+    return {
+        "train_loss": loss_task_tot.avg,
+        "train_acc": top1.avg.item(),
+        "train_bias_loss": loss_private_tot.avg,
+        "train_bias_acc": private_top1.avg.item(),
+    }
+
+
+def count_elements_per_class(basemodel: VCBABaseModel):
+    """
+    Counts the number of samples of each target class in the dataset
+    """
+    tk0 = tqdm(basemodel.dataloaders["train"],
+               total=int(len(basemodel.dataloaders["train"])),
+               leave=True, )
+    elements_per_class = torch.zeros(size=(1, basemodel.nb_classes),
+                                     device=basemodel.device,
+                                     requires_grad=False)
+    for _, (_, target, _, _) in enumerate(tk0):
+        target = target.to(basemodel.device)
+        target_one_hot = one_hot(target, num_classes=basemodel.nb_classes)
+        elements_per_class += torch.sum(target_one_hot, dim=0)
+    return elements_per_class
+
+
+def build_predicted_bias_labels(
+        predicted_bias_labels: torch.Tensor,
+        train_loader: DataLoader,
+        device: torch.device,
+        num_classes: int = 2,
+):
+    """
+    Builds the tensor containing the inferred bias labels
+    """
+    tk0 = tqdm(train_loader, total=int(len(train_loader)), leave=True)
+    predicted_bias_target = torch.zeros_like(predicted_bias_labels)
+    for _, (_, target, bias_target, indices) in enumerate(tk0):
+        target = target.to(device)
+        bias_target = bias_target.to(device)
+        indices = indices.to(device)
+        predicted_bias_target[indices] = predicted_bias_labels[indices] * (
+                predicted_bias_labels[indices] != num_classes
+        ) + target * (predicted_bias_labels[indices] == num_classes)
+    return predicted_bias_target
