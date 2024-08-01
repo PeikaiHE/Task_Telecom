@@ -6,5 +6,6 @@ And for more information, please refer to the original paper [![paper](https://i
 [![arXiv](https://img.shields.io/badge/arXiv-2305.03691-b31b1b.svg)](https://arxiv.org/abs/2305.03691), and for the code, you can find here [![code](https://img.shields.io/badge/GitHub-Code-blue)](https://github.com/renahon/mining_bias_target_alignment_from_voronoi_cells/blob/main/README.md?plain=1).
 
 ## Results
+To achieve the results, I did some code changes to make it work. Such as in train_and_debias.py 
 
 For more results, you can find in the notebook file.
